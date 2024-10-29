@@ -436,14 +436,7 @@ func (j *Job) partialSync() error {
 		log.Debugf("partial sync job info size: %d, bytes: %.128s", len(jobInfoBytes), string(jobInfoBytes))
 		snapshotResp.SetJobInfo(jobInfoBytes)
 
-		// save the entire commit seq map, this value will be used in PersistRestoreInfo.
-		if len(j.progress.TableCommitSeqMap) == 0 {
-			j.progress.TableCommitSeqMap = make(map[int64]int64)
-		}
-		for tableId, commitSeq := range inMemoryData.TableCommitSeqMap {
-			j.progress.TableCommitSeqMap[tableId] = commitSeq
-		}
-		j.progress.NextSubCheckpoint(RestoreSnapshot, inMemoryData)
+		j.progress.NextSubVolatile(RestoreSnapshot, inMemoryData)
 
 	case RestoreSnapshot:
 		// Step 4: Restore snapshot
@@ -519,11 +512,19 @@ func (j *Job) partialSync() error {
 			}
 
 			if restoreFinished {
-				j.progress.NextSubCheckpoint(PersistRestoreInfo, restoreSnapshotName)
 				break
 			}
 			// retry for  MAX_CHECK_RETRY_TIMES, timeout, continue
 		}
+
+		// save the entire commit seq map, this value will be used in PersistRestoreInfo.
+		if len(j.progress.TableCommitSeqMap) == 0 {
+			j.progress.TableCommitSeqMap = make(map[int64]int64)
+		}
+		for tableId, commitSeq := range inMemoryData.TableCommitSeqMap {
+			j.progress.TableCommitSeqMap[tableId] = commitSeq
+		}
+		j.progress.NextSubCheckpoint(PersistRestoreInfo, restoreSnapshotName)
 
 	case PersistRestoreInfo:
 		// Step 5: Update job progress && dest table id
@@ -681,7 +682,6 @@ func (j *Job) fullSync() error {
 		inMemoryData := j.progress.InMemoryData.(*inMemoryData)
 		snapshotResp := inMemoryData.SnapshotResp
 		jobInfo := snapshotResp.GetJobInfo()
-		tableCommitSeqMap := inMemoryData.TableCommitSeqMap
 
 		log.Infof("snapshot response meta size: %d, job info size: %d",
 			len(snapshotResp.Meta), len(snapshotResp.JobInfo))
@@ -693,17 +693,7 @@ func (j *Job) fullSync() error {
 		log.Debugf("job info size: %d, bytes: %.128s", len(jobInfoBytes), string(jobInfoBytes))
 		snapshotResp.SetJobInfo(jobInfoBytes)
 
-		var commitSeq int64 = math.MaxInt64
-		switch j.SyncType {
-		case DBSync:
-			for _, seq := range tableCommitSeqMap {
-				commitSeq = utils.Min(commitSeq, seq)
-			}
-			j.progress.TableCommitSeqMap = tableCommitSeqMap // persist in CommitNext
-		case TableSync:
-			commitSeq = tableCommitSeqMap[j.Src.TableId]
-		}
-		j.progress.CommitNextSubWithPersist(commitSeq, RestoreSnapshot, inMemoryData)
+		j.progress.NextSubVolatile(RestoreSnapshot, inMemoryData)
 
 	case RestoreSnapshot:
 		// Step 4: Restore snapshot
@@ -806,7 +796,7 @@ func (j *Job) fullSync() error {
 						j.progress.TableAliases = make(map[string]string)
 					}
 					j.progress.TableAliases[tableName] = tableAlias(tableName)
-					j.progress.CommitNextSubWithPersist(j.progress.CommitSeq, RestoreSnapshot, inMemoryData)
+					j.progress.NextSubVolatile(RestoreSnapshot, inMemoryData)
 					break
 				}
 				for {
@@ -827,7 +817,19 @@ func (j *Job) fullSync() error {
 			}
 
 			if restoreFinished {
-				j.progress.NextSubCheckpoint(PersistRestoreInfo, restoreSnapshotName)
+				tableCommitSeqMap := inMemoryData.TableCommitSeqMap
+				var commitSeq int64 = math.MaxInt64
+				switch j.SyncType {
+				case DBSync:
+					for _, seq := range tableCommitSeqMap {
+						commitSeq = utils.Min(commitSeq, seq)
+					}
+					j.progress.TableCommitSeqMap = tableCommitSeqMap // persist in CommitNext
+				case TableSync:
+					commitSeq = tableCommitSeqMap[j.Src.TableId]
+				}
+
+				j.progress.CommitNextSubWithPersist(commitSeq, PersistRestoreInfo, restoreSnapshotName)
 				break
 			}
 			// retry for  MAX_CHECK_RETRY_TIMES, timeout, continue
