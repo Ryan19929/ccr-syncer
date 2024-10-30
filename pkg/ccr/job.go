@@ -398,10 +398,12 @@ func (j *Job) partialSync() error {
 			return xerror.New(xerror.Normal, "jobInfo is not set")
 		}
 
-		tableCommitSeqMap, err := ExtractTableCommitSeqMap(snapshotResp.GetJobInfo())
+		backupJobInfo, err := NewBackupJobInfoFromJson(snapshotResp.GetJobInfo())
 		if err != nil {
 			return err
 		}
+
+		tableCommitSeqMap := backupJobInfo.TableCommitSeqMap
 
 		log.Debugf("table commit seq map: %v", tableCommitSeqMap)
 		if j.SyncType == TableSync {
@@ -596,6 +598,7 @@ func (j *Job) fullSync() error {
 		SnapshotResp      *festruct.TGetSnapshotResult_ `json:"snapshot_resp"`
 		TableCommitSeqMap map[int64]int64               `json:"table_commit_seq_map"`
 		TableNameMapping  map[int64]string              `json:"table_name_mapping"`
+		Views             []string                      `json:"views"`
 	}
 
 	switch j.progress.SubSyncState {
@@ -658,15 +661,14 @@ func (j *Job) fullSync() error {
 			return xerror.New(xerror.Normal, "jobInfo is not set")
 		}
 
-		tableCommitSeqMap, err := ExtractTableCommitSeqMap(snapshotResp.GetJobInfo())
+		backupJobInfo, err := NewBackupJobInfoFromJson(snapshotResp.GetJobInfo())
 		if err != nil {
 			return err
 		}
 
-		tableMapping, err := ExtractTableMapping(snapshotResp.GetJobInfo())
-		if err != nil {
-			return err
-		}
+		tableCommitSeqMap := backupJobInfo.TableCommitSeqMap
+		tableNameMapping := backupJobInfo.TableNameMapping()
+		views := backupJobInfo.Views()
 
 		if j.SyncType == TableSync {
 			if _, ok := tableCommitSeqMap[j.Src.TableId]; !ok {
@@ -678,7 +680,8 @@ func (j *Job) fullSync() error {
 			SnapshotName:      snapshotName,
 			SnapshotResp:      snapshotResp,
 			TableCommitSeqMap: tableCommitSeqMap,
-			TableNameMapping:  tableMapping,
+			TableNameMapping:  tableNameMapping,
+			Views:             views,
 		}
 		j.progress.NextSubVolatile(AddExtraInfo, inMemoryData)
 
@@ -742,11 +745,25 @@ func (j *Job) fullSync() error {
 		}
 		if len(j.progress.TableAliases) > 0 {
 			tableRefs = make([]*festruct.TTableRef, 0)
+			for _, tableName := range tableNameMapping {
+				if alias, ok := j.progress.TableAliases[tableName]; ok {
+					log.Debugf("fullsync alias skip table ref %s because it has alias %s", tableName, alias)
+					continue
+				}
+				log.Debugf("fullsync alias with table ref %s", tableName)
+				tableRef := &festruct.TTableRef{Table: utils.ThriftValueWrapper(tableName)}
+				tableRefs = append(tableRefs, tableRef)
+			}
+			for _, viewName := range inMemoryData.Views {
+				log.Debugf("fullsync alias with view ref %s", viewName)
+				tableRef := &festruct.TTableRef{Table: utils.ThriftValueWrapper(viewName)}
+				tableRefs = append(tableRefs, tableRef)
+			}
 			for table, alias := range j.progress.TableAliases {
-				log.Debugf("fullsync alias table from %s to %s", table, alias)
+				log.Infof("fullsync alias table from %s to %s", table, alias)
 				tableRef := &festruct.TTableRef{
-					Table:     &table,
-					AliasName: &alias,
+					Table:     utils.ThriftValueWrapper(table),
+					AliasName: utils.ThriftValueWrapper(alias),
 				}
 				tableRefs = append(tableRefs, tableRef)
 			}
