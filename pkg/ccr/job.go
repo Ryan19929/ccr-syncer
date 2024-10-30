@@ -595,6 +595,7 @@ func (j *Job) fullSync() error {
 		SnapshotName      string                        `json:"snapshot_name"`
 		SnapshotResp      *festruct.TGetSnapshotResult_ `json:"snapshot_resp"`
 		TableCommitSeqMap map[int64]int64               `json:"table_commit_seq_map"`
+		TableNameMapping  map[int64]string              `json:"table_name_mapping"`
 	}
 
 	switch j.progress.SubSyncState {
@@ -662,6 +663,11 @@ func (j *Job) fullSync() error {
 			return err
 		}
 
+		tableMapping, err := ExtractTableMapping(snapshotResp.GetJobInfo())
+		if err != nil {
+			return err
+		}
+
 		if j.SyncType == TableSync {
 			if _, ok := tableCommitSeqMap[j.Src.TableId]; !ok {
 				return xerror.Errorf(xerror.Normal, "table id %d, commit seq not found", j.Src.TableId)
@@ -672,6 +678,7 @@ func (j *Job) fullSync() error {
 			SnapshotName:      snapshotName,
 			SnapshotResp:      snapshotResp,
 			TableCommitSeqMap: tableCommitSeqMap,
+			TableNameMapping:  tableMapping,
 		}
 		j.progress.NextSubVolatile(AddExtraInfo, inMemoryData)
 
@@ -713,6 +720,7 @@ func (j *Job) fullSync() error {
 		snapshotName := inMemoryData.SnapshotName
 		restoreSnapshotName := restoreSnapshotName(snapshotName)
 		snapshotResp := inMemoryData.SnapshotResp
+		tableNameMapping := inMemoryData.TableNameMapping
 
 		// Step 4.2: restore snapshot to dest
 		dest := &j.Dest
@@ -825,6 +833,7 @@ func (j *Job) fullSync() error {
 						commitSeq = utils.Min(commitSeq, seq)
 					}
 					j.progress.TableCommitSeqMap = tableCommitSeqMap // persist in CommitNext
+					j.progress.TableNameMapping = tableNameMapping
 				case TableSync:
 					commitSeq = tableCommitSeqMap[j.Src.TableId]
 				}
@@ -882,16 +891,24 @@ func (j *Job) fullSync() error {
 			j.destMeta.ClearTablesCache()
 			tableMapping := make(map[int64]int64)
 			for srcTableId := range j.progress.TableCommitSeqMap {
-				srcTableName, err := j.srcMeta.GetTableNameById(srcTableId)
-				if err != nil {
-					return err
-				}
+				var srcTableName string
+				if name, ok := j.progress.TableNameMapping[srcTableId]; ok {
+					srcTableName = name
+				} else {
+					// Keep compatible, but once the upstream table is renamed, the
+					// downstream table id will not be found here.
+					name, err := j.srcMeta.GetTableNameById(srcTableId)
+					if err != nil {
+						return err
+					}
+					srcTableName = name
 
-				// If srcTableName is empty, it may be deleted.
-				// No need to map it to dest table
-				if srcTableName == "" {
-					log.Warnf("the name of source table id: %d is empty, no need to map it to dest table", srcTableId)
-					continue
+					// If srcTableName is empty, it may be deleted.
+					// No need to map it to dest table
+					if srcTableName == "" {
+						log.Warnf("the name of source table id: %d is empty, no need to map it to dest table", srcTableId)
+						continue
+					}
 				}
 
 				destTableId, err := j.destMeta.GetTableId(srcTableName)
