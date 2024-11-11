@@ -324,6 +324,11 @@ class Helper {
         return result
     }
 
+    String upstream_version() {
+        def version_variables = suite.sql_return_maparray "show variables like 'version_comment'"
+        return version_variables[0].Value
+    }
+
     Boolean is_version_supported(versions) {
         def version_variables = suite.sql_return_maparray "show variables like 'version_comment'"
         def matcher = version_variables[0].Value =~ /doris-(\d+\.\d+\.\d+)/
