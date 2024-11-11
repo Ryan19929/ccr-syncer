@@ -43,6 +43,7 @@ var (
 	featureReplaceNotMatchedWithAlias   bool
 	featureFilterShadowIndexesUpsert    bool
 	featureReuseRunningBackupRestoreJob bool
+	featureCompressedSnapshot           bool
 )
 
 func init() {
@@ -62,6 +63,8 @@ func init() {
 		"filter the upsert to the shadow indexes")
 	flag.BoolVar(&featureReuseRunningBackupRestoreJob, "feature_reuse_running_backup_restore_job", false,
 		"reuse the running backup/restore issued by the job self")
+	flag.BoolVar(&featureCompressedSnapshot, "feature_compressed_snapshot", true,
+		"compress the snapshot job info and meta")
 }
 
 type SyncType int
@@ -414,7 +417,8 @@ func (j *Job) partialSync() error {
 		}
 
 		log.Debugf("partial sync begin get snapshot %s", snapshotName)
-		snapshotResp, err := srcRpc.GetSnapshot(src, snapshotName)
+		compress := false // partial snapshot no need to compress
+		snapshotResp, err := srcRpc.GetSnapshot(src, snapshotName, compress)
 		if err != nil {
 			return err
 		}
@@ -545,6 +549,7 @@ func (j *Job) partialSync() error {
 			CleanPartitions: false,
 			CleanTables:     false,
 			AtomicRestore:   false,
+			Compress:        false,
 		}
 		restoreResp, err := destRpc.RestoreSnapshot(dest, &restoreReq)
 		if err != nil {
@@ -737,7 +742,8 @@ func (j *Job) fullSync() error {
 		}
 
 		log.Debugf("fullsync begin get snapshot %s", snapshotName)
-		snapshotResp, err := srcRpc.GetSnapshot(src, snapshotName)
+		compress := false
+		snapshotResp, err := srcRpc.GetSnapshot(src, snapshotName, compress)
 		if err != nil {
 			return err
 		}
@@ -747,11 +753,24 @@ func (j *Job) fullSync() error {
 			return err
 		}
 
-		log.Tracef("fullsync snapshot job: %.128s", snapshotResp.GetJobInfo())
 		if !snapshotResp.IsSetJobInfo() {
 			return xerror.New(xerror.Normal, "jobInfo is not set")
 		}
 
+		if snapshotResp.GetCompressed() {
+			if bytes, err := utils.GZIPDecompress(snapshotResp.GetJobInfo()); err != nil {
+				return xerror.Wrap(err, xerror.Normal, "decompress snapshot job info failed")
+			} else {
+				snapshotResp.SetJobInfo(bytes)
+			}
+			if bytes, err := utils.GZIPDecompress(snapshotResp.GetMeta()); err != nil {
+				return xerror.Wrap(err, xerror.Normal, "decompress snapshot meta failed")
+			} else {
+				snapshotResp.SetMeta(bytes)
+			}
+		}
+
+		log.Tracef("fullsync snapshot job: %.128s", snapshotResp.GetJobInfo())
 		backupJobInfo, err := NewBackupJobInfoFromJson(snapshotResp.GetJobInfo())
 		if err != nil {
 			return err
@@ -873,6 +892,14 @@ func (j *Job) fullSync() error {
 			}
 		}
 
+		compress := false
+		if featureCompressedSnapshot {
+			if enable, err := j.IDest.IsEnableRestoreSnapshotCompression(); err != nil {
+				return xerror.Wrap(err, xerror.Normal, "check enable restore snapshot compression failed")
+			} else {
+				compress = enable
+			}
+		}
 		restoreReq := rpc.RestoreSnapshotRequest{
 			TableRefs:       tableRefs,
 			SnapshotName:    restoreSnapshotName,
@@ -880,6 +907,7 @@ func (j *Job) fullSync() error {
 			CleanPartitions: false,
 			CleanTables:     false,
 			AtomicRestore:   false,
+			Compress:        compress,
 		}
 		if featureCleanTableAndPartitions {
 			// drop exists partitions, and drop tables if in db sync.
@@ -957,7 +985,7 @@ func (j *Job) fullSync() error {
 			}
 
 			if !restoreFinished {
-				log.Info("fullsync status: restore job %s is running", restoreSnapshotName)
+				log.Infof("fullsync status: restore job %s is running", restoreSnapshotName)
 				return nil
 			}
 
