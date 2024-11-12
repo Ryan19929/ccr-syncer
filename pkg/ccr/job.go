@@ -423,7 +423,14 @@ func (j *Job) partialSync() error {
 			return err
 		}
 
-		if snapshotResp.Status.GetStatusCode() != tstatus.TStatusCode_OK {
+		if snapshotResp.Status.GetStatusCode() == tstatus.TStatusCode_SNAPSHOT_NOT_EXIST ||
+			snapshotResp.Status.GetStatusCode() == tstatus.TStatusCode_SNAPSHOT_EXPIRED {
+			log.Warnf("get snapshot %s: %s (%s), retry with new partial sync", snapshotName,
+				utils.FirstOr(snapshotResp.Status.GetErrorMsgs(), "unknown"),
+				snapshotResp.Status.GetStatusCode())
+			replace := len(j.progress.TableAliases) > 0
+			return j.newPartialSnapshot(table, partitions, replace)
+		} else if snapshotResp.Status.GetStatusCode() != tstatus.TStatusCode_OK {
 			err = xerror.Errorf(xerror.FE, "get snapshot failed, status: %v", snapshotResp.Status)
 			return err
 		}
@@ -433,9 +440,6 @@ func (j *Job) partialSync() error {
 		}
 
 		log.Tracef("job: %.128s", snapshotResp.GetJobInfo())
-		if !snapshotResp.IsSetJobInfo() {
-			return xerror.New(xerror.Normal, "jobInfo is not set")
-		}
 
 		backupJobInfo, err := NewBackupJobInfoFromJson(snapshotResp.GetJobInfo())
 		if err != nil {
@@ -466,8 +470,8 @@ func (j *Job) partialSync() error {
 		snapshotResp := inMemoryData.SnapshotResp
 		jobInfo := snapshotResp.GetJobInfo()
 
-		log.Infof("partial sync snapshot response meta size: %d, job info size: %d",
-			len(snapshotResp.Meta), len(snapshotResp.JobInfo))
+		log.Infof("partial sync snapshot response meta size: %d, job info size: %d, expired at: %d",
+			len(snapshotResp.Meta), len(snapshotResp.JobInfo), snapshotResp.GetExpiredAt())
 
 		jobInfoBytes, err := j.addExtraInfo(jobInfo)
 		if err != nil {
@@ -568,6 +572,16 @@ func (j *Job) partialSync() error {
 		// Step 6: Wait restore job done
 		inMemoryData := j.progress.InMemoryData.(*inMemoryData)
 		restoreSnapshotName := inMemoryData.RestoreLabel
+		snapshotResp := inMemoryData.SnapshotResp
+
+		if snapshotResp.GetExpiredAt() > 0 && time.Now().UnixMilli() > snapshotResp.GetExpiredAt() {
+			log.Infof("partial sync snapshot %s is expired, cancel and retry with new partial sync", restoreSnapshotName)
+			if err := j.IDest.CancelRestoreIfExists(restoreSnapshotName); err != nil {
+				return err
+			}
+			replace := len(j.progress.TableAliases) > 0
+			return j.newPartialSnapshot(table, partitions, replace)
+		}
 
 		restoreFinished, err := j.IDest.CheckRestoreFinished(restoreSnapshotName)
 		if err != nil {
@@ -748,7 +762,13 @@ func (j *Job) fullSync() error {
 			return err
 		}
 
-		if snapshotResp.Status.GetStatusCode() != tstatus.TStatusCode_OK {
+		if snapshotResp.Status.GetStatusCode() == tstatus.TStatusCode_SNAPSHOT_NOT_EXIST ||
+			snapshotResp.Status.GetStatusCode() == tstatus.TStatusCode_SNAPSHOT_EXPIRED {
+			log.Warnf("get snapshot %s: %s (%s), retry with new full sync", snapshotName,
+				utils.FirstOr(snapshotResp.Status.GetErrorMsgs(), "unknown"),
+				snapshotResp.Status.GetStatusCode())
+			return j.newSnapshot(j.progress.CommitSeq)
+		} else if snapshotResp.Status.GetStatusCode() != tstatus.TStatusCode_OK {
 			err = xerror.Errorf(xerror.FE, "get snapshot failed, status: %v", snapshotResp.Status)
 			return err
 		}
@@ -803,8 +823,8 @@ func (j *Job) fullSync() error {
 		snapshotResp := inMemoryData.SnapshotResp
 		jobInfo := snapshotResp.GetJobInfo()
 
-		log.Infof("snapshot response meta size: %d, job info size: %d",
-			len(snapshotResp.Meta), len(snapshotResp.JobInfo))
+		log.Infof("snapshot response meta size: %d, job info size: %d, expired at: %d",
+			len(snapshotResp.Meta), len(snapshotResp.JobInfo), snapshotResp.GetExpiredAt())
 
 		jobInfoBytes, err := j.addExtraInfo(jobInfo)
 		if err != nil {
@@ -937,6 +957,15 @@ func (j *Job) fullSync() error {
 		inMemoryData := j.progress.InMemoryData.(*inMemoryData)
 		restoreSnapshotName := inMemoryData.RestoreLabel
 		tableNameMapping := inMemoryData.TableNameMapping
+		snapshotResp := inMemoryData.SnapshotResp
+
+		if snapshotResp.GetExpiredAt() > 0 && time.Now().UnixMilli() > snapshotResp.GetExpiredAt() {
+			log.Infof("fullsync snapshot %s is expired, cancel and retry with new full sync", restoreSnapshotName)
+			if err := j.IDest.CancelRestoreIfExists(restoreSnapshotName); err != nil {
+				return err
+			}
+			return j.newSnapshot(j.progress.CommitSeq)
+		}
 
 		for {
 			restoreFinished, err := j.IDest.CheckRestoreFinished(restoreSnapshotName)
