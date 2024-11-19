@@ -1090,7 +1090,6 @@ func (j *Job) fullSync() error {
 			}
 
 			j.progress.CommitNextSubWithPersist(commitSeq, PersistRestoreInfo, restoreSnapshotName)
-			j.progress.NextSubCheckpoint(PersistRestoreInfo, restoreSnapshotName)
 			break
 		}
 
