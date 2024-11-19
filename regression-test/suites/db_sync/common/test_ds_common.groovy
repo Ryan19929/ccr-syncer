@@ -15,16 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-<<<<<<<< HEAD:regression-test/suites/db-sync/test_db_sync.groovy
-suite("test_db_sync") {
-========
 suite("test_ds_common") {
     def versions = sql_return_maparray "show variables like 'version_comment'"
     if (versions[0].Value.contains('doris-2.0.')) {
         logger.info("2.0 not support AUTO PARTITION, current version is: ${versions[0].Value}")
         return
     }
->>>>>>>> a134ed7 (Reorg db/table sync suites (#219)):regression-test/suites/db_sync/common/test_ds_common.groovy
 
     def helper = new GroovyShell(new Binding(['suite': delegate]))
             .evaluate(new File("${context.config.suitePath}/../common", "helper.groovy"))
