@@ -1555,6 +1555,33 @@ func (s *Spec) ModifyTableProperty(destTableName string, modifyProperty *record.
 	return s.Exec(sql)
 }
 
+func (s *Spec) ModifyPartitionProperty(destTableName string, batchModifyPartitionsInfo *record.BatchModifyPartitionsInfo) error {
+	if batchModifyPartitionsInfo == nil || len(batchModifyPartitionsInfo.Infos) == 0 {
+		log.Warnf("empty partition infos, skip modify partition property")
+		return nil
+	}
+
+	dbName := utils.FormatKeywordName(s.Database)
+	destTableName = utils.FormatKeywordName(destTableName)
+
+	for _, partitionInfo := range batchModifyPartitionsInfo.Infos {
+		if partitionInfo.DataProperty == nil || partitionInfo.DataProperty.StorageMedium == "" {
+			log.Warnf("partition %d has no storage medium, skip modify partition property", partitionInfo.PartitionId)
+			continue
+		}
+
+		sql := fmt.Sprintf("ALTER TABLE %s.%s MODIFY PARTITION %s SET (\"storage_medium\" = \"%s\")",
+			dbName, destTableName, utils.FormatKeywordName(partitionInfo.PartitionName), partitionInfo.DataProperty.StorageMedium)
+
+		log.Infof("modify partition property sql: %s", sql)
+		if err := s.Exec(sql); err != nil {
+			log.Warnf("modify partition %s property failed: %v", partitionInfo.PartitionName, err)
+		}
+	}
+
+	return nil
+}
+
 // Determine whether the error are network related, eg connection refused, connection reset, exposed from net packages.
 func isNetworkRelated(err error) bool {
 	msg := err.Error()
@@ -1682,4 +1709,49 @@ func NormalizeCreateViewSql(destDatabase string, srcDatabase string, createSql s
 		strings.ReplaceAll(createSql, originalNameNewStyle, replaceName), originalNameOldStyle, replaceName)
 	log.Debugf("original create view sql is %s, after replace, now sql is %s", originSql, createSql)
 	return createSql
+}
+
+// Helper method to get partition name by partition range
+func (s *Spec) getPartitionNameByRange(tableName string, partitionRange string) (string, error) {
+	db, err := s.Connect()
+	if err != nil {
+		return "", err
+	}
+
+	query := fmt.Sprintf("SHOW PARTITIONS FROM %s.%s",
+		utils.FormatKeywordName(s.Database), tableName)
+
+	log.Debugf("getPartitionNameByRange SQL: %s", query)
+	rows, err := db.Query(query)
+	if err != nil {
+		return "", xerror.Wrapf(err, xerror.Normal, "failed to query partition info, sql: %s", query)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		rowParser := utils.NewRowParser()
+		if err := rowParser.Parse(rows); err != nil {
+			return "", xerror.Wrap(err, xerror.Normal, "failed to parse partition info")
+		}
+
+		// Get partition range and name
+		currentPartitionRange, err := rowParser.GetString("Range")
+		if err != nil {
+			continue // Skip if we can't get partition range
+		}
+
+		if currentPartitionRange == partitionRange {
+			partitionName, err := rowParser.GetString("PartitionName")
+			if err != nil {
+				return "", xerror.Wrap(err, xerror.Normal, "failed to get partition name")
+			}
+			return partitionName, nil
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", xerror.Wrapf(err, xerror.Normal, "failed to scan partition info, sql: %s", query)
+	}
+
+	return "", xerror.Errorf(xerror.Normal, "partition not found: partition range '%s'", partitionRange)
 }

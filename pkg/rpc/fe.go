@@ -91,14 +91,15 @@ func canUseNextAddr(err error) bool {
 }
 
 type RestoreSnapshotRequest struct {
-	TableRefs       []*festruct.TTableRef
-	SnapshotName    string
-	SnapshotResult  *festruct.TGetSnapshotResult_
-	AtomicRestore   bool
-	CleanPartitions bool
-	CleanTables     bool
-	Compress        bool
-	ForceReplace    bool
+	TableRefs        []*festruct.TTableRef
+	SnapshotName     string
+	SnapshotResult   *festruct.TGetSnapshotResult_
+	AtomicRestore    bool
+	CleanPartitions  bool
+	CleanTables      bool
+	Compress         bool
+	ForceReplace     bool
+	MediumSyncPolicy string
 }
 
 type IFeRpc interface {
@@ -866,26 +867,27 @@ func (rpc *singleFeClient) RestoreSnapshot(spec *base.Spec, restoreReq *RestoreS
 	}
 
 	req := &festruct.TRestoreSnapshotRequest{
-		Table:           &spec.Table,
-		LabelName:       &restoreReq.SnapshotName,
-		RepoName:        &repoName,
-		TableRefs:       restoreReq.TableRefs,
-		Properties:      properties,
-		Meta:            meta,
-		JobInfo:         jobInfo,
-		CleanTables:     &restoreReq.CleanTables,
-		CleanPartitions: &restoreReq.CleanPartitions,
-		AtomicRestore:   &restoreReq.AtomicRestore,
-		Compressed:      utils.ThriftValueWrapper(restoreReq.Compress),
-		ForceReplace:    &restoreReq.ForceReplace,
+		Table:            &spec.Table,
+		LabelName:        &restoreReq.SnapshotName,
+		RepoName:         &repoName,
+		TableRefs:        restoreReq.TableRefs,
+		Properties:       properties,
+		Meta:             meta,
+		JobInfo:          jobInfo,
+		CleanTables:      &restoreReq.CleanTables,
+		CleanPartitions:  &restoreReq.CleanPartitions,
+		AtomicRestore:    &restoreReq.AtomicRestore,
+		Compressed:       utils.ThriftValueWrapper(restoreReq.Compress),
+		ForceReplace:     &restoreReq.ForceReplace,
+		MediumSyncPolicy: utils.ThriftValueWrapper(restoreReq.MediumSyncPolicy),
 	}
 	setAuthInfo(req, spec)
 
 	// NOTE: ignore meta, because it's too large
-	log.Debugf("RestoreSnapshotRequest user %s, db %s, table %s, label name %s, properties %v, clean tables: %t, clean partitions: %t, atomic restore: %t, compressed: %t, forceReplace: %t",
+	log.Debugf("RestoreSnapshotRequest user %s, db %s, table %s, label name %s, properties %v, clean tables: %t, clean partitions: %t, atomic restore: %t, compressed: %t, forceReplace: %t, mediumSyncPolicy: %s",
 		req.GetUser(), req.GetDb(), req.GetTable(), req.GetLabelName(), properties,
 		restoreReq.CleanTables, restoreReq.CleanPartitions, restoreReq.AtomicRestore,
-		req.GetCompressed(), restoreReq.ForceReplace)
+		req.GetCompressed(), restoreReq.ForceReplace, req.GetMediumSyncPolicy())
 
 	if resp, err := client.RestoreSnapshot(context.Background(), req); err != nil {
 		return nil, xerror.Wrapf(err, xerror.RPC, "RestoreSnapshot failed")

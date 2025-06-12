@@ -103,6 +103,8 @@ type CreateCcrRequest struct {
 	// For table sync, allow to create ccr job even if the target table already exists.
 	AllowTableExists bool `json:"allow_table_exists"`
 	ReuseBinlogLabel bool `json:"reuse_binlog_label"`
+	// Medium sync policy for backup/restore operations: "hdd" or "same_with_upstream"
+	MediumSyncPolicy string `json:"medium_sync_policy"`
 }
 
 // Stringer
@@ -139,9 +141,11 @@ func createCcr(request *CreateCcrRequest, db storage.DB, jobManager *ccr.JobMana
 		SkipError:        request.SkipError,
 		AllowTableExists: request.AllowTableExists,
 		ReuseBinlogLabel: request.ReuseBinlogLabel,
+		MediumSyncPolicy: request.MediumSyncPolicy,
 		Db:               db,
 		Factory:          jobManager.GetFactory(),
 	}
+
 	job, err := ccr.NewJobFromService(request.Name, ctx)
 	if err != nil {
 		return err
@@ -1084,6 +1088,51 @@ func (s *HttpService) failpointHandler(w http.ResponseWriter, r *http.Request) {
 	result = newSuccessResult()
 }
 
+type UpdateMediumSyncPolicyRequest struct {
+	CcrCommonRequest
+	MediumSyncPolicy string `json:"medium_sync_policy"`
+}
+
+func (s *HttpService) updateMediumSyncPolicyHandler(w http.ResponseWriter, r *http.Request) {
+	log.Infof("update medium sync policy")
+
+	var result *defaultResult
+	defer func() { writeJson(w, result) }()
+
+	// Parse the JSON request body
+	var request UpdateMediumSyncPolicyRequest
+	err := json.NewDecoder(r.Body).Decode(&request)
+	if err != nil {
+		log.Warnf("update medium sync policy failed: %+v", err)
+		result = newErrorResult(err.Error())
+		return
+	}
+
+	if request.Name == "" {
+		log.Warnf("update medium sync policy failed: name is empty")
+		result = newErrorResult("name is empty")
+		return
+	}
+
+	if request.MediumSyncPolicy == "" {
+		log.Warnf("update medium sync policy failed: medium_sync_policy is empty")
+		result = newErrorResult("medium_sync_policy is empty")
+		return
+	}
+
+	if s.redirect(request.Name, w, r) {
+		return
+	}
+
+	log.Infof("update medium sync policy for job %s to %s", request.Name, request.MediumSyncPolicy)
+	if err := s.jobManager.UpdateMediumSyncPolicy(request.Name, request.MediumSyncPolicy); err != nil {
+		log.Warnf("update medium sync policy failed: %+v", err)
+		result = newErrorResult(err.Error())
+	} else {
+		result = newSuccessResult()
+	}
+}
+
 func (s *HttpService) RegisterHandlers() {
 	s.mux.HandleFunc("/version", s.versionHandler)
 	s.mux.HandleFunc("/create_ccr", s.createHandler)
@@ -1104,6 +1153,7 @@ func (s *HttpService) RegisterHandlers() {
 	s.mux.Handle("/metrics", xmetrics.GetHttpHandler())
 	s.mux.HandleFunc("/sync", s.syncHandler)
 	s.mux.HandleFunc("/view", s.showJobStateHandler)
+	s.mux.HandleFunc("/update_medium_sync_policy", s.updateMediumSyncPolicyHandler)
 }
 
 func (s *HttpService) Start() error {

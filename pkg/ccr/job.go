@@ -77,6 +77,7 @@ var (
 	featureSkipCheckAsyncMvTable        bool
 	featurePipelineCommit               bool
 	featureSeperatedHandles             bool
+	FeatureMediumSyncPolicy             bool
 
 	flagBinlogBatchSize int64
 
@@ -120,6 +121,8 @@ func init() {
 		"enable pipeline commit for upsert binlogs")
 	flag.BoolVar(&featureSeperatedHandles, "feature_seperated_handles", true,
 		"enable the seperated handles (the refactor)")
+	flag.BoolVar(&FeatureMediumSyncPolicy, "feature_medium_sync_policy", true,
+		"enable medium sync policy support for sync job")
 
 	flag.Int64Var(&flagBinlogBatchSize, "binlog_batch_size", 16, "the max num of binlogs to get in a batch")
 }
@@ -129,6 +132,12 @@ type SyncType int
 const (
 	DBSync    SyncType = 0
 	TableSync SyncType = 1
+)
+
+// Medium sync policy constants
+const (
+	MediumSyncPolicyHDD              = "hdd"
+	MediumSyncPolicySameWithUpstream = "same_with_upstream"
 )
 
 func (s SyncType) String() string {
@@ -211,6 +220,8 @@ type Job struct {
 	destMeta Metaer      `json:"-"`
 	State    JobState    `json:"state"`
 	Extra    JobExtra    `json:"extra"`
+	// Medium sync policy for backup/restore operations: "hdd" or "same_with_upstream"
+	MediumSyncPolicy string `json:"medium_sync_policy"`
 
 	factory *Factory `json:"-"`
 
@@ -237,6 +248,7 @@ type JobContext struct {
 	SkipError        bool
 	AllowTableExists bool
 	ReuseBinlogLabel bool
+	MediumSyncPolicy string
 	Factory          *Factory
 }
 
@@ -251,16 +263,30 @@ func NewJobFromService(name string, ctx context.Context) (*Job, error) {
 	src := jobContext.Src
 	dest := jobContext.Dest
 	id := getJobId(name, src, dest)
+	// Set default medium sync policy if not specified
+	mediumSyncPolicy := jobContext.MediumSyncPolicy
+	log.Infof("NewJobFromService: received medium_sync_policy=%s from JobContext", mediumSyncPolicy)
+	if mediumSyncPolicy == "" {
+		mediumSyncPolicy = MediumSyncPolicyHDD
+		log.Infof("NewJobFromService: medium_sync_policy was empty, set to default=%s", mediumSyncPolicy)
+	}
+	// Validate medium sync policy
+	if mediumSyncPolicy != MediumSyncPolicyHDD && mediumSyncPolicy != MediumSyncPolicySameWithUpstream {
+		return nil, xerror.Errorf(xerror.Normal, "invalid medium sync policy: %s, must be %s or %s",
+			mediumSyncPolicy, MediumSyncPolicyHDD, MediumSyncPolicySameWithUpstream)
+	}
+
 	job := &Job{
-		Name:     name,
-		Id:       id,
-		Src:      src,
-		ISrc:     factory.NewSpecer(&src),
-		srcMeta:  factory.NewMeta(&jobContext.Src),
-		Dest:     dest,
-		IDest:    factory.NewSpecer(&dest),
-		destMeta: factory.NewMeta(&jobContext.Dest),
-		State:    JobRunning,
+		Name:             name,
+		Id:               id,
+		Src:              src,
+		ISrc:             factory.NewSpecer(&src),
+		srcMeta:          factory.NewMeta(&jobContext.Src),
+		Dest:             dest,
+		IDest:            factory.NewSpecer(&dest),
+		destMeta:         factory.NewMeta(&jobContext.Dest),
+		State:            JobRunning,
+		MediumSyncPolicy: mediumSyncPolicy,
 
 		Extra: JobExtra{
 			allowTableExists: jobContext.AllowTableExists,
@@ -277,6 +303,7 @@ func NewJobFromService(name string, ctx context.Context) (*Job, error) {
 
 		concurrencyManager: rpc.NewConcurrencyManager(),
 	}
+	log.Infof("NewJobFromService: Job created with MediumSyncPolicy=%s", job.MediumSyncPolicy)
 
 	if err := job.valid(); err != nil {
 		return nil, xerror.Wrap(err, xerror.Normal, "job is invalid")
@@ -724,6 +751,14 @@ func (j *Job) partialSync() error {
 		// resulting in different schema of upstream and downstream views. we need to force replace
 		isForceReplace := featureRestoreReplaceDiffSchema && j.progress.PartialSyncData.IsView
 		isAtomicRestore := featureAtomicRestore && isForceReplace
+		mediumSyncPolicy := "hdd"
+		log.Infof("partialSync: FeatureMediumSyncPolicy=%t, j.MediumSyncPolicy=%s", FeatureMediumSyncPolicy, j.MediumSyncPolicy)
+		if FeatureMediumSyncPolicy && j.MediumSyncPolicy != "" {
+			mediumSyncPolicy = j.MediumSyncPolicy
+			log.Infof("partialSync: using job medium_sync_policy=%s", mediumSyncPolicy)
+		} else {
+			log.Infof("partialSync: using default medium_sync_policy=%s", mediumSyncPolicy)
+		}
 
 		restoreReq := rpc.RestoreSnapshotRequest{
 			TableRefs:      tableRefs,
@@ -731,11 +766,12 @@ func (j *Job) partialSync() error {
 			SnapshotResult: snapshotResp,
 
 			// DO NOT drop exists tables and partitions
-			CleanPartitions: false,
-			CleanTables:     false,
-			AtomicRestore:   isAtomicRestore,
-			Compress:        false,
-			ForceReplace:    isForceReplace,
+			CleanPartitions:  false,
+			CleanTables:      false,
+			AtomicRestore:    isAtomicRestore,
+			Compress:         false,
+			ForceReplace:     isForceReplace,
+			MediumSyncPolicy: mediumSyncPolicy,
 		}
 		restoreResp, err := destRpc.RestoreSnapshot(dest, &restoreReq)
 		if err != nil {
@@ -1178,6 +1214,12 @@ func (j *Job) fullSync() error {
 		}
 		if featureRestoreReplaceDiffSchema {
 			restoreReq.ForceReplace = true
+		}
+		if FeatureMediumSyncPolicy {
+			restoreReq.MediumSyncPolicy = j.MediumSyncPolicy
+			log.Infof("fullSync: FeatureMediumSyncPolicy enabled, setting MediumSyncPolicy=%s", j.MediumSyncPolicy)
+		} else {
+			log.Infof("fullSync: FeatureMediumSyncPolicy disabled, not setting MediumSyncPolicy")
 		}
 		restoreResp, err := destRpc.RestoreSnapshot(dest, &restoreReq)
 		if err != nil {
@@ -4594,4 +4636,27 @@ func getJobId(name string, src base.Spec, dest base.Spec) string {
 	io.WriteString(h, src.String())
 	io.WriteString(h, dest.String())
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func (j *Job) UpdateMediumSyncPolicy(mediumSyncPolicy string) error {
+	defer j.raiseInterruptSignal()()
+	j.lock.Lock()
+	defer j.lock.Unlock()
+
+	// Validate medium sync policy
+	if mediumSyncPolicy != MediumSyncPolicyHDD && mediumSyncPolicy != MediumSyncPolicySameWithUpstream {
+		return xerror.Errorf(xerror.Normal, "invalid medium sync policy: %s, must be %s or %s",
+			mediumSyncPolicy, MediumSyncPolicyHDD, MediumSyncPolicySameWithUpstream)
+	}
+
+	oldMediumSyncPolicy := j.MediumSyncPolicy
+	j.MediumSyncPolicy = mediumSyncPolicy
+
+	if err := j.persistJob(); err != nil {
+		j.MediumSyncPolicy = oldMediumSyncPolicy
+		return err
+	}
+
+	log.Infof("update job %s medium sync policy from %s to %s", j.Name, oldMediumSyncPolicy, mediumSyncPolicy)
+	return nil
 }

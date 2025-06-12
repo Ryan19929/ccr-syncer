@@ -1,6 +1,8 @@
 package handle
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/selectdb/ccr_syncer/pkg/ccr"
@@ -16,6 +18,176 @@ func init() {
 
 type CreateTableHandle struct {
 	IdempotentJobHandle[*record.CreateTable]
+}
+
+// Check if error message indicates storage medium or capacity related issues
+func isStorageMediumError(errMsg string) bool {
+	log.Infof("STORAGE_MEDIUM_DEBUG: Analyzing error message: %s", errMsg)
+
+	patterns := []string{
+		"capExceedLimit",
+		"Failed to find enough backend",
+		"not enough backend",
+		"storage medium",
+		"storage_medium",
+		"avail capacity",
+		"disk space",
+		"not enough space",
+		"replication num",
+		"replication tag",
+	}
+
+	for _, pattern := range patterns {
+		if strings.Contains(strings.ToLower(errMsg), strings.ToLower(pattern)) {
+			log.Infof("STORAGE_MEDIUM_DEBUG: Found storage/capacity related pattern '%s' in error message", pattern)
+			return true
+		}
+	}
+
+	log.Infof("STORAGE_MEDIUM_DEBUG: No storage/capacity related patterns found in error message")
+	return false
+}
+
+// Extract storage_medium from CREATE TABLE SQL
+func extractStorageMediumFromCreateTableSql(createSql string) string {
+	pattern := `"storage_medium"\s*=\s*"([^"]*)"`
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(createSql)
+	if len(matches) >= 2 {
+		medium := strings.ToLower(matches[1])
+		log.Infof("STORAGE_MEDIUM_DEBUG: Extracted storage medium: %s", medium)
+		return medium
+	}
+	log.Infof("STORAGE_MEDIUM_DEBUG: No storage medium found in SQL")
+	return ""
+}
+
+// Switch storage medium between SSD and HDD
+func switchStorageMedium(medium string) string {
+	switch strings.ToLower(medium) {
+	case "ssd":
+		return "hdd"
+	case "hdd":
+		return "ssd"
+	default:
+		// Default to hdd if not standard medium
+		return "hdd"
+	}
+}
+
+// Set specific storage_medium in CREATE TABLE SQL
+func setStorageMediumInCreateTableSql(createSql string, medium string) string {
+	// Remove existing storage_medium first
+	createSql = ccr.FilterStorageMediumFromCreateTableSql(createSql)
+
+	// Check if PROPERTIES clause exists
+	propertiesPattern := `PROPERTIES\s*\(`
+	if matched, _ := regexp.MatchString(propertiesPattern, createSql); matched {
+		// Add storage_medium at the beginning of PROPERTIES
+		pattern := `(PROPERTIES\s*\(\s*)`
+		replacement := fmt.Sprintf(`${1}"storage_medium" = "%s", `, medium)
+		createSql = regexp.MustCompile(pattern).ReplaceAllString(createSql, replacement)
+	} else {
+		// Add entire PROPERTIES clause
+		pattern := `(\s*)$`
+		replacement := fmt.Sprintf(` PROPERTIES ("storage_medium" = "%s")`, medium)
+		createSql = regexp.MustCompile(pattern).ReplaceAllString(createSql, replacement)
+	}
+
+	return createSql
+}
+
+// Process CREATE TABLE SQL according to medium sync policy
+func processCreateTableSqlByMediumPolicy(j *ccr.Job, createTable *record.CreateTable) error {
+	// Note: We need to access Job's medium sync policy and feature flags
+	// For now, we'll implement basic logic based on what we know the Job should do
+
+	// Check if medium sync policy feature is enabled (we assume it's enabled for new handler)
+	// This is a simplified version that handles the main cases
+	mediumPolicy := j.MediumSyncPolicy
+
+	switch mediumPolicy {
+	case ccr.MediumSyncPolicySameWithUpstream:
+		// Keep upstream storage_medium unchanged
+		log.Infof("using same_with_upstream policy, keeping original storage_medium")
+		return nil
+
+	case ccr.MediumSyncPolicyHDD:
+		// Force set to HDD
+		log.Infof("using hdd policy, setting storage_medium to hdd")
+		createTable.Sql = setStorageMediumInCreateTableSql(createTable.Sql, "hdd")
+		return nil
+
+	default:
+		log.Warnf("unknown medium sync policy: %s, falling back to filter storage_medium", mediumPolicy)
+		if ccr.FeatureFilterStorageMedium {
+			createTable.Sql = ccr.FilterStorageMediumFromCreateTableSql(createTable.Sql)
+		}
+		return nil
+	}
+}
+
+// Create table with medium retry mechanism
+func createTableWithMediumRetry(j *ccr.Job, createTable *record.CreateTable, srcDb string) error {
+	originalSql := createTable.Sql
+	log.Infof("STORAGE_MEDIUM_DEBUG: Starting create table with medium retry for table: %s", createTable.TableName)
+
+	// Process SQL according to medium policy
+	if err := processCreateTableSqlByMediumPolicy(j, createTable); err != nil {
+		return err
+	}
+
+	// First attempt
+	err := j.IDest.CreateTableOrView(createTable, srcDb)
+	if err == nil {
+		log.Infof("STORAGE_MEDIUM_DEBUG: Create table succeeded on first attempt")
+		return nil
+	}
+
+	log.Warnf("STORAGE_MEDIUM_DEBUG: First attempt failed: %s", err.Error())
+
+	// Check if it's storage related error and should retry
+	if !isStorageMediumError(err.Error()) {
+		log.Infof("STORAGE_MEDIUM_DEBUG: Not a storage related error, no retry")
+		return err
+	}
+
+	// Extract current medium and switch to the other one
+	currentMedium := extractStorageMediumFromCreateTableSql(createTable.Sql)
+	if currentMedium == "" {
+		currentMedium = "ssd" // default
+	}
+
+	switchedMedium := switchStorageMedium(currentMedium)
+	log.Infof("STORAGE_MEDIUM_DEBUG: Switching from %s to %s", currentMedium, switchedMedium)
+
+	createTable.Sql = setStorageMediumInCreateTableSql(originalSql, switchedMedium)
+
+	// Second attempt with switched medium
+	err = j.IDest.CreateTableOrView(createTable, srcDb)
+	if err == nil {
+		log.Infof("STORAGE_MEDIUM_DEBUG: Create table succeeded after switching to %s", switchedMedium)
+		return nil
+	}
+
+	log.Warnf("STORAGE_MEDIUM_DEBUG: Second attempt with %s also failed: %s", switchedMedium, err.Error())
+
+	// Final attempt: remove storage_medium if still storage related error
+	if isStorageMediumError(err.Error()) {
+		log.Infof("STORAGE_MEDIUM_DEBUG: Removing storage_medium for final attempt")
+		createTable.Sql = ccr.FilterStorageMediumFromCreateTableSql(originalSql)
+
+		err = j.IDest.CreateTableOrView(createTable, srcDb)
+		if err == nil {
+			log.Infof("STORAGE_MEDIUM_DEBUG: Create table succeeded after removing storage_medium")
+			return nil
+		}
+
+		log.Warnf("STORAGE_MEDIUM_DEBUG: Final attempt without storage_medium also failed: %s", err.Error())
+	}
+
+	log.Errorf("STORAGE_MEDIUM_DEBUG: All attempts failed, returning final error")
+	return err
 }
 
 func (h *CreateTableHandle) Handle(j *ccr.Job, commitSeq int64, createTable *record.CreateTable) error {
@@ -68,12 +240,11 @@ func (h *CreateTableHandle) Handle(j *ccr.Job, commitSeq int64, createTable *rec
 		}
 	}
 
-	if ccr.FeatureFilterStorageMedium {
-		createTable.Sql = ccr.FilterStorageMediumFromCreateTableSql(createTable.Sql)
-	}
+	// Remove old storage_medium filtering logic, handled by new retry function
 	createTable.Sql = ccr.FilterDynamicPartitionStoragePolicyFromCreateTableSql(createTable.Sql)
 
-	if err := j.IDest.CreateTableOrView(createTable, j.Src.Database); err != nil {
+	// Use new create table function with medium retry mechanism
+	if err := createTableWithMediumRetry(j, createTable, j.Src.Database); err != nil {
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "Can not found function") {
 			log.Warnf("skip creating table/view because the UDF function is not supported yet: %s", errMsg)
