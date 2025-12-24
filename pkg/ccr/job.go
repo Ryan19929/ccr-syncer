@@ -876,10 +876,10 @@ func (j *Job) partialSync() error {
 		if len(partitions) > 0 {
 			j.progress.PartitionCommitSeqMap = utils.MergeMap(
 				j.progress.PartitionCommitSeqMap, inMemoryData.PartitionCommitSeqMap)
-		} else {
-			j.progress.TableCommitSeqMap = utils.MergeMap(
-				j.progress.TableCommitSeqMap, inMemoryData.TableCommitSeqMap)
 		}
+		// Always save TableCommitSeqMap regardless of partitions, as it's needed in TableSync mode
+		j.progress.TableCommitSeqMap = utils.MergeMap(
+			j.progress.TableCommitSeqMap, inMemoryData.TableCommitSeqMap)
 		j.progress.TableNameMapping = utils.MergeMap(
 			j.progress.TableNameMapping, inMemoryData.TableNameMapping)
 		j.currentRestoreName = "" // Restore done, clear the name
