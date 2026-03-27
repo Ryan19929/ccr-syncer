@@ -79,6 +79,9 @@ type DB interface {
 	GetAllData() (map[string][]string, error)
 	// GetJobs
 	GetJobs() ([]string, error)
+
+	// UpdateJobBelong updates the belong_to field of a job to migrate it to another syncer node.
+	UpdateJobBelong(jobName string, targetHost string) error
 }
 
 func SetDBOptions(db *sql.DB) {

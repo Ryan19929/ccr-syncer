@@ -408,6 +408,21 @@ func (s *SQLiteDB) RebalanceLoadFromDeadSyncers(syncers []string) error {
 	return nil
 }
 
+func (s *SQLiteDB) UpdateJobBelong(jobName string, targetHost string) error {
+	result, err := s.db.Exec("UPDATE jobs SET belong_to = ? WHERE job_name = ?", targetHost, jobName)
+	if err != nil {
+		return xerror.Wrapf(err, xerror.DB, "sqlite: update job belong_to failed, name: %s", jobName)
+	}
+	rowNum, err := result.RowsAffected()
+	if err != nil {
+		return xerror.Wrapf(err, xerror.DB, "sqlite: update job belong_to get affected rows failed, name: %s", jobName)
+	}
+	if rowNum == 0 {
+		return ErrJobNotExists
+	}
+	return nil
+}
+
 func (s *SQLiteDB) GetAllData() (map[string][]string, error) {
 	ans := make(map[string][]string)
 

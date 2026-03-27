@@ -432,6 +432,21 @@ func (s *MysqlDB) RebalanceLoadFromDeadSyncers(syncers []string) error {
 	return nil
 }
 
+func (s *MysqlDB) UpdateJobBelong(jobName string, targetHost string) error {
+	result, err := s.db.Exec(fmt.Sprintf("UPDATE jobs SET belong_to = '%s' WHERE job_name = '%s'", targetHost, jobName))
+	if err != nil {
+		return xerror.Wrapf(err, xerror.DB, "mysql: update job belong_to failed, name: %s", jobName)
+	}
+	rowNum, err := result.RowsAffected()
+	if err != nil {
+		return xerror.Wrapf(err, xerror.DB, "mysql: update job belong_to get affected rows failed, name: %s", jobName)
+	}
+	if rowNum == 0 {
+		return ErrJobNotExists
+	}
+	return nil
+}
+
 func (s *MysqlDB) GetAllData() (map[string][]string, error) {
 	ans := make(map[string][]string)
 

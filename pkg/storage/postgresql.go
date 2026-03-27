@@ -430,6 +430,21 @@ func (s *PostgresqlDB) RebalanceLoadFromDeadSyncers(syncers []string) error {
 	return nil
 }
 
+func (s *PostgresqlDB) UpdateJobBelong(jobName string, targetHost string) error {
+	result, err := s.db.Exec(fmt.Sprintf("UPDATE %s.jobs SET belong_to = '%s' WHERE job_name = '%s'", s.dbName, targetHost, jobName))
+	if err != nil {
+		return xerror.Wrapf(err, xerror.DB, "postgresql: update job belong_to failed, name: %s", jobName)
+	}
+	rowNum, err := result.RowsAffected()
+	if err != nil {
+		return xerror.Wrapf(err, xerror.DB, "postgresql: update job belong_to get affected rows failed, name: %s", jobName)
+	}
+	if rowNum == 0 {
+		return ErrJobNotExists
+	}
+	return nil
+}
+
 func (s *PostgresqlDB) GetAllData() (map[string][]string, error) {
 	ans := make(map[string][]string)
 
