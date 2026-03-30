@@ -1260,6 +1260,18 @@ func (s *HttpService) migrateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	alive, err := s.db.IsSyncerAlive(request.TargetNode, ccr.CHECK_TIMEOUT)
+	if err != nil {
+		log.Warnf("migrate job failed: check target node alive failed: %+v", err)
+		result = newErrorResult(fmt.Sprintf("target node %s not found in syncers table", request.TargetNode))
+		return
+	}
+	if !alive {
+		log.Warnf("migrate job failed: target node %s is not alive", request.TargetNode)
+		result = newErrorResult(fmt.Sprintf("target node %s is not alive (heartbeat timeout)", request.TargetNode))
+		return
+	}
+
 	if err := s.jobManager.ReleaseJob(request.Name); err != nil {
 		log.Warnf("migrate job release failed: %+v", err)
 		result = newErrorResult(err.Error())
@@ -1270,6 +1282,13 @@ func (s *HttpService) migrateHandler(w http.ResponseWriter, r *http.Request) {
 		log.Errorf("migrate job update belong_to failed: %+v", err)
 		result = newErrorResult(err.Error())
 		return
+	}
+
+	// Invalidate the target node's heartbeat timestamp so its Checker's
+	// next RefreshSyncer CAS fails, triggering handleUpdate to pick up the job.
+	if err := s.db.InvalidateSyncerStamp(request.TargetNode); err != nil {
+		log.Warnf("migrate job [%s]: invalidate target stamp failed: %+v (target will pick up on next CAS conflict or restart)",
+			request.Name, err)
 	}
 
 	log.Infof("job [%s] migrated to %s", request.Name, request.TargetNode)
