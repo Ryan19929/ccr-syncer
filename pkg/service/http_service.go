@@ -1331,12 +1331,41 @@ func (s *HttpService) migrateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if anySucceeded {
-		if err := s.db.InvalidateSyncerStamp(request.TargetNode); err != nil {
-			log.Warnf("migrate: invalidate target stamp failed: %+v (target will pick up on next CAS conflict or restart)", err)
-		}
+		s.notifyTargetNode(request.TargetNode)
 	}
 
 	writeJson(w, &result)
+}
+
+func (s *HttpService) notifyTargetNode(targetNode string) {
+	url := fmt.Sprintf("http://%s/notify_update", targetNode)
+	resp, err := http.Post(url, "application/json", nil)
+	if err != nil {
+		log.Warnf("notify target %s failed: %v (target will pick up on next check cycle)", targetNode, err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func (s *HttpService) notifyUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	log.Infof("received notify_update request")
+
+	_, jobs, err := s.db.GetStampAndJobs(s.hostInfo)
+	if err != nil {
+		log.Warnf("notify_update: get jobs failed: %+v", err)
+		writeJson(w, newErrorResult(err.Error()))
+		return
+	}
+	if len(jobs) > 0 {
+		if err := s.jobManager.Recover(jobs); err != nil {
+			log.Warnf("notify_update: recover jobs failed: %+v", err)
+			writeJson(w, newErrorResult(err.Error()))
+			return
+		}
+		log.Infof("notify_update: recovered jobs %v", jobs)
+	}
+
+	writeJson(w, newSuccessResult())
 }
 
 func (s *HttpService) RegisterHandlers() {
@@ -1362,6 +1391,7 @@ func (s *HttpService) RegisterHandlers() {
 	s.mux.HandleFunc("/view", s.showJobStateHandler)
 	s.mux.HandleFunc("/node_info", s.nodeInfoHandler)
 	s.mux.HandleFunc("/migrate", s.migrateHandler)
+	s.mux.HandleFunc("/notify_update", s.notifyUpdateHandler)
 }
 
 func (s *HttpService) Start() error {
