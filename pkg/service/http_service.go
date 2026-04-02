@@ -1224,75 +1224,119 @@ func (s *HttpService) nodeInfoHandler(w http.ResponseWriter, r *http.Request) {
 	writeJson(w, result)
 }
 
+// migrateHandler supports both single and batch migration via the same /migrate endpoint.
+// Single mode: {"name": "job1", "target_node": "host:port"}
+// Batch mode:  {"names": ["job1","job2"], "target_node": "host:port"}
+// If "name" is provided and "names" is empty, "name" is treated as names: [name].
 func (s *HttpService) migrateHandler(w http.ResponseWriter, r *http.Request) {
-	log.Infof("migrate job")
+	log.Infof("migrate jobs")
 
-	var result *defaultResult
-	defer func() { writeJson(w, result) }()
+	type resultItem struct {
+		Name    string `json:"name"`
+		Success bool   `json:"success"`
+		Error   string `json:"error,omitempty"`
+	}
+	type migrateResult struct {
+		Success   bool         `json:"success"`
+		Total     int          `json:"total"`
+		Succeeded int          `json:"succeeded"`
+		Failed    int          `json:"failed"`
+		Results   []resultItem `json:"results"`
+		ErrorMsg  string       `json:"error_msg,omitempty"`
+	}
+
+	writeErr := func(msg string) {
+		writeJson(w, &migrateResult{Success: false, ErrorMsg: msg})
+	}
 
 	var request struct {
-		Name       string `json:"name"`
-		TargetNode string `json:"target_node"`
+		Name       string   `json:"name"`
+		Names      []string `json:"names"`
+		TargetNode string   `json:"target_node"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-		log.Warnf("migrate job failed: %+v", err)
-		result = newErrorResult(err.Error())
+		log.Warnf("migrate failed: %+v", err)
+		writeErr(err.Error())
 		return
 	}
 
-	if request.Name == "" {
-		log.Warnf("migrate job failed: name is empty")
-		result = newErrorResult("name is empty")
-		return
+	// "name" -> "names" compatibility
+	if len(request.Names) == 0 && request.Name != "" {
+		request.Names = []string{request.Name}
 	}
+
 	if request.TargetNode == "" {
-		log.Warnf("migrate job failed: target_node is empty")
-		result = newErrorResult("target_node is empty")
+		writeErr("target_node is empty")
 		return
 	}
 	if request.TargetNode == s.hostInfo {
-		log.Warnf("migrate job failed: target_node is the same as current node")
-		result = newErrorResult("target_node is the same as current node")
+		writeErr("target_node is the same as current node")
 		return
 	}
-
-	if s.redirect(request.Name, w, r) {
+	if len(request.Names) == 0 {
+		writeErr("name or names is required")
 		return
 	}
 
 	alive, err := s.db.IsSyncerAlive(request.TargetNode, ccr.CHECK_TIMEOUT)
 	if err != nil {
-		log.Warnf("migrate job failed: check target node alive failed: %+v", err)
-		result = newErrorResult(fmt.Sprintf("target node %s not found in syncers table", request.TargetNode))
+		log.Warnf("migrate: check target node alive failed, target_node: %s, err: %+v", request.TargetNode, err)
+		writeErr(fmt.Sprintf("target node %s not found or not accessible: %v", request.TargetNode, err))
 		return
 	}
 	if !alive {
-		log.Warnf("migrate job failed: target node %s is not alive", request.TargetNode)
-		result = newErrorResult(fmt.Sprintf("target node %s is not alive (heartbeat timeout)", request.TargetNode))
+		log.Warnf("migrate: target node %s is not alive", request.TargetNode)
+		writeErr(fmt.Sprintf("target node %s is not alive (heartbeat timeout)", request.TargetNode))
 		return
 	}
 
-	if err := s.jobManager.ReleaseJob(request.Name); err != nil {
-		log.Warnf("migrate job release failed: %+v", err)
-		result = newErrorResult(err.Error())
-		return
+	result := migrateResult{
+		Success: true,
+		Total:   len(request.Names),
+		Results: make([]resultItem, 0, len(request.Names)),
 	}
 
-	if err := s.db.UpdateJobBelong(request.Name, request.TargetNode); err != nil {
-		log.Errorf("migrate job update belong_to failed: %+v", err)
-		result = newErrorResult(err.Error())
-		return
+	anySucceeded := false
+	for _, name := range request.Names {
+		belongHost, err := s.db.GetJobBelong(name)
+		if err != nil {
+			result.Failed++
+			result.Results = append(result.Results, resultItem{Name: name, Success: false, Error: fmt.Sprintf("get job belong failed: %v", err)})
+			continue
+		}
+		if belongHost != s.hostInfo {
+			result.Failed++
+			result.Results = append(result.Results, resultItem{Name: name, Success: false, Error: fmt.Sprintf("job belongs to %s, not this node", belongHost)})
+			continue
+		}
+
+		if err := s.jobManager.ReleaseJob(name); err != nil {
+			log.Warnf("migrate: release job [%s] failed: %+v", name, err)
+			result.Failed++
+			result.Results = append(result.Results, resultItem{Name: name, Success: false, Error: err.Error()})
+			continue
+		}
+
+		if err := s.db.UpdateJobBelong(name, request.TargetNode); err != nil {
+			log.Errorf("migrate: update belong_to for [%s] failed: %+v", name, err)
+			result.Failed++
+			result.Results = append(result.Results, resultItem{Name: name, Success: false, Error: err.Error()})
+			continue
+		}
+
+		log.Infof("migrate: job [%s] migrated to %s", name, request.TargetNode)
+		result.Succeeded++
+		result.Results = append(result.Results, resultItem{Name: name, Success: true})
+		anySucceeded = true
 	}
 
-	// Invalidate the target node's heartbeat timestamp so its Checker's
-	// next RefreshSyncer CAS fails, triggering handleUpdate to pick up the job.
-	if err := s.db.InvalidateSyncerStamp(request.TargetNode); err != nil {
-		log.Warnf("migrate job [%s]: invalidate target stamp failed: %+v (target will pick up on next CAS conflict or restart)",
-			request.Name, err)
+	if anySucceeded {
+		if err := s.db.InvalidateSyncerStamp(request.TargetNode); err != nil {
+			log.Warnf("migrate: invalidate target stamp failed: %+v (target will pick up on next CAS conflict or restart)", err)
+		}
 	}
 
-	log.Infof("job [%s] migrated to %s", request.Name, request.TargetNode)
-	result = newSuccessResult()
+	writeJson(w, &result)
 }
 
 func (s *HttpService) RegisterHandlers() {
