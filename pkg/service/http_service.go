@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -74,10 +75,12 @@ func newSuccessResult() *defaultResult {
 }
 
 type HttpService struct {
-	port     int
-	server   *http.Server
-	mux      *http.ServeMux
-	hostInfo string
+	host      string
+	port      int
+	server    *http.Server
+	mux       *http.ServeMux
+	hostInfo  string
+	startTime time.Time
 
 	db         storage.DB
 	jobManager *ccr.JobManager
@@ -85,9 +88,11 @@ type HttpService struct {
 
 func NewHttpServer(host string, port int, db storage.DB, jobManager *ccr.JobManager) *HttpService {
 	return &HttpService{
-		port:     port,
-		mux:      http.NewServeMux(),
-		hostInfo: fmt.Sprintf("%s:%d", host, port),
+		host:      host,
+		port:      port,
+		mux:       http.NewServeMux(),
+		hostInfo:  fmt.Sprintf("%s:%d", host, port),
+		startTime: time.Now(),
 
 		db:         db,
 		jobManager: jobManager,
@@ -1121,6 +1126,73 @@ func (s *HttpService) failpointHandler(w http.ResponseWriter, r *http.Request) {
 	result = newSuccessResult()
 }
 
+func (s *HttpService) nodeInfoHandler(w http.ResponseWriter, r *http.Request) {
+	log.Infof("get node info")
+
+	type configInfo struct {
+		DbType string `json:"db_type"`
+	}
+	type resourceInfo struct {
+		GoroutineCount int    `json:"goroutine_count"`
+		MemoryUsedMB   uint64 `json:"memory_used_mb"`
+	}
+	type taskStats struct {
+		Total   int `json:"total"`
+		Running int `json:"running"`
+		Paused  int `json:"paused"`
+	}
+	type nodeInfoResult struct {
+		*defaultResult
+		Version       string       `json:"version"`
+		Host          string       `json:"host"`
+		Port          int          `json:"port"`
+		UptimeSeconds int64        `json:"uptime_seconds"`
+		Config        configInfo   `json:"config"`
+		Resources     resourceInfo `json:"resources"`
+		Tasks         taskStats    `json:"tasks"`
+	}
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	jobs := s.jobManager.ListJobs()
+	running, paused := 0, 0
+	for _, job := range jobs {
+		if job.State == "paused" {
+			paused++
+		} else {
+			running++
+		}
+	}
+
+	dbType := "sqlite3"
+	if f := flag.Lookup("db_type"); f != nil {
+		dbType = f.Value.String()
+	}
+
+	result := &nodeInfoResult{
+		defaultResult: newSuccessResult(),
+		Version:       version.GetVersion(),
+		Host:          s.host,
+		Port:          s.port,
+		UptimeSeconds: int64(time.Since(s.startTime).Seconds()),
+		Config: configInfo{
+			DbType: dbType,
+		},
+		Resources: resourceInfo{
+			GoroutineCount: runtime.NumGoroutine(),
+			MemoryUsedMB:   memStats.Alloc / 1024 / 1024,
+		},
+		Tasks: taskStats{
+			Total:   len(jobs),
+			Running: running,
+			Paused:  paused,
+		},
+	}
+
+	writeJson(w, result)
+}
+
 func (s *HttpService) RegisterHandlers() {
 	s.mux.HandleFunc("/version", s.versionHandler)
 	s.mux.HandleFunc("/create_ccr", s.createHandler)
@@ -1141,6 +1213,7 @@ func (s *HttpService) RegisterHandlers() {
 	s.mux.Handle("/metrics", xmetrics.GetHttpHandler())
 	s.mux.HandleFunc("/sync", s.syncHandler)
 	s.mux.HandleFunc("/view", s.showJobStateHandler)
+	s.mux.HandleFunc("/node_info", s.nodeInfoHandler)
 }
 
 func (s *HttpService) Start() error {
