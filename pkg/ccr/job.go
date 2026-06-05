@@ -4435,7 +4435,8 @@ func (j *Job) updateFrontends() error {
 			j.Src.Frontends = append(j.Src.Frontends, *frontend)
 		}
 	}
-	log.Debugf("src frontends %+v", j.Src.Frontends)
+	log.Infof("update frontends done, job: %s, side: src, count: %d, frontends: %+v",
+		j.Name, len(j.Src.Frontends), j.Src.Frontends)
 
 	if frontends, err := j.destMeta.GetFrontends(); err != nil {
 		log.Warnf("get dest frontends failed, fe: %+v", j.Dest)
@@ -4445,7 +4446,8 @@ func (j *Job) updateFrontends() error {
 			j.Dest.Frontends = append(j.Dest.Frontends, *frontend)
 		}
 	}
-	log.Debugf("dest frontends %+v", j.Dest.Frontends)
+	log.Infof("update frontends done, job: %s, side: dest, count: %d, frontends: %+v",
+		j.Name, len(j.Dest.Frontends), j.Dest.Frontends)
 
 	return nil
 }

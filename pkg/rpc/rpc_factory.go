@@ -66,16 +66,17 @@ func (rf *RpcFactory) NewFeRpc(spec *base.Spec) (IFeRpc, error) {
 	rf.feRpcsLock.Lock()
 	if feRpc, ok := rf.feRpcs[key]; ok {
 		rf.feRpcsLock.Unlock()
-		log.Tracef("RpcFactory: reused cached FeRpc for %s (cache hit)", key)
+		log.Infof("RpcFactory: reused cached FeRpc for %s (cache hit), addrs: %s", key, feRpc.Address())
 		return feRpc, nil
 	}
 	rf.feRpcsLock.Unlock()
 
-	log.Tracef("RpcFactory: creating new FeRpc for %s (cache miss)", key)
+	log.Infof("RpcFactory: creating new FeRpc for %s (cache miss), spec frontends: %v", key, spec.Frontends)
 	feRpc, err := NewFeRpc(spec)
 	if err != nil {
 		return nil, err
 	}
+	log.Infof("RpcFactory: created FeRpc for %s, addrs: %s", key, feRpc.Address())
 
 	rf.feRpcsLock.Lock()
 	defer rf.feRpcsLock.Unlock()

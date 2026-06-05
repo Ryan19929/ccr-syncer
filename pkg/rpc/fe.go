@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -139,6 +140,7 @@ func NewFeRpc(spec *base.Spec) (*FeRpc, error) {
 	clients := make(map[string]IFeRpc)
 	clients[client.Address()] = client
 	cachedFeAddrs := make(map[string]bool)
+	log.Infof("FeRpc init start, base addr: %s, spec: %s, spec frontends: %s", addr, spec, formatFrontends(spec.Frontends))
 	for _, fe := range spec.Frontends {
 		addr := fmt.Sprintf("%s:%s", fe.Host, fe.ThriftPort)
 
@@ -148,19 +150,47 @@ func NewFeRpc(spec *base.Spec) (*FeRpc, error) {
 
 		// for cached all spec clients
 		if client, err := newSingleFeClient(addr); err != nil {
-			log.Warnf("new fe client error: %+v", err)
+			log.Warnf("FeRpc init cached FE client failed, addr: %s, err: %+v", addr, err)
 		} else {
 			clients[client.Address()] = client
 		}
 		cachedFeAddrs[addr] = true
 	}
 
-	return &FeRpc{
+	feRpc := &FeRpc{
 		spec:          spec,
 		masterClient:  client,
 		clients:       clients,
 		cachedFeAddrs: cachedFeAddrs,
-	}, nil
+	}
+	log.Infof("FeRpc init done, base addr: %s, active addrs: %s, cached FE addrs: %s", addr,
+		formatClientAddrs(clients), formatBoolMapKeys(cachedFeAddrs))
+	return feRpc, nil
+}
+
+func formatFrontends(frontends []base.Frontend) string {
+	if len(frontends) == 0 {
+		return "[]"
+	}
+
+	addrs := make([]string, 0, len(frontends))
+	for _, fe := range frontends {
+		addrs = append(addrs, fmt.Sprintf("%s:%s(query:%s,master:%t)", fe.Host, fe.ThriftPort, fe.Port, fe.IsMaster))
+	}
+	sort.Strings(addrs)
+	return "[" + strings.Join(addrs, ",") + "]"
+}
+
+func formatClientAddrs(clients map[string]IFeRpc) string {
+	addrs := utils.Keys(clients)
+	sort.Strings(addrs)
+	return "[" + strings.Join(addrs, ",") + "]"
+}
+
+func formatBoolMapKeys(addrs map[string]bool) string {
+	keys := utils.Keys(addrs)
+	sort.Strings(keys)
+	return "[" + strings.Join(keys, ",") + "]"
 }
 
 // get all fe addrs
@@ -273,6 +303,9 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call0(masterClient IFeRpc) 
 		}
 	}
 
+	log.Warnf("FE RPC returned NOT_MASTER, addr: %s, master address set: %t, cached addrs: %s",
+		masterClient.Address(), resp.IsSetMasterAddress(), r.rpc.Address())
+
 	// no compatible for master
 	if !resp.IsSetMasterAddress() {
 		err = xerror.XPanicWrapf(ErrFeNotMasterCompatible, "fe addr [%s]", masterClient.Address())
@@ -285,6 +318,8 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call0(masterClient IFeRpc) 
 	// switch to master
 	masterAddr := resp.GetMasterAddress()
 	err = xerror.Errorf(xerror.FE, "addr [%s] is not master", masterAddr)
+	log.Infof("FE RPC NOT_MASTER redirect target, current addr: %s, master addr: %s:%d",
+		masterClient.Address(), masterAddr.Hostname, masterAddr.Port)
 
 	// convert private ip to public ip, if need
 	hostname := masterAddr.Hostname
@@ -355,9 +390,13 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call() (RetryCall, resultTy
 	// Step 4: try all cached fe clients
 	if r.notriedClients == nil {
 		r.notriedClients = rpc.getClients()
+		log.Warnf("FE RPC fallback to cached FE clients, current master: %s, candidates: %s, last err: %+v",
+			masterClient.Address(), formatClientAddrs(r.notriedClients), result.err)
 	}
 	delete(r.notriedClients, masterClient.Address())
 	if len(r.notriedClients) == 0 {
+		log.Warnf("FE RPC exhausted cached FE clients, all addrs: %s, last tried: %s, last err: %+v",
+			rpc.Address(), masterClient.Address(), result.err)
 		return RetryCallNone, nil, result.err
 	}
 	// get first notried client
@@ -366,6 +405,8 @@ func (r *retryWithMasterRedirectAndCachedClientsRpc) call() (RetryCall, resultTy
 		break
 	}
 	// because call0 failed, so original masterClient is not master now, set client as masterClient for retry
+	log.Warnf("FE RPC switch to next cached FE, previous: %s, next: %s, remaining candidates: %s",
+		masterClient.Address(), client.Address(), formatClientAddrs(r.notriedClients))
 	rpc.updateMasterClient(client)
 	return RetryCallDelayed, nil, nil
 }
